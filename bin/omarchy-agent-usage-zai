@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+# omarchy:summary=Print the Z.ai GLM Coding Plan usage record as JSON
+
+"""Collect Z.ai GLM Coding Plan quota into one display-ready JSON record.
+
+Probes the monitoring endpoint that backs
+z.ai/manage-apikey/coding-plan/personal/usage and writes the record the
+omarchy.agents panel watches at
+~/.local/state/omarchy/agents/usage/zai.json.
+
+Credential resolution, first match wins:
+  1. ~/.config/omarchy/agents/zai.json  {"apiKey": "..."}
+  2. $ZAI_API_KEY / $ZAI_CODING_API_KEY
+  3. opencode auth.json: zai-coding-plan, then zai
+
+The key is the coding-plan API key from z.ai/manage-apikey — the same one
+used as ANTHROPIC_AUTH_TOKEN with https://api.z.ai/api/anthropic. Auth is
+the raw token (no "Bearer" prefix), matching Z.ai's official query-usage
+script (github.com/zai-org/zai-coding-plugins).
+"""
+
+import argparse
+import datetime as dt
+import json
+import os
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+AGENT_ID = "zai"
+AGENT_NAME = "Z.ai GLM"
+QUOTA_ENDPOINT = "https://api.z.ai/api/monitor/usage/quota/limit"
+USER_AGENT = "omarchy-agent-usage-zai"
+PROBE_MIN_INTERVAL_SECONDS = 300
+AUTH_HELP = (
+  "Set a Z.ai coding-plan API key in ~/.config/omarchy/agents/zai.json: "
+  '{"apiKey": "..."}. Issue the key at z.ai/manage-apikey; it is the same '
+  "key used as ANTHROPIC_AUTH_TOKEN with https://api.z.ai/api/anthropic."
+)
+
+# Quota window units, from Z.ai's response contract:
+#   TOKENS_LIMIT unit 3 -> 5-hour rolling token window
+#   TOKENS_LIMIT unit 6 -> weekly token quota (newer plans only)
+#   TIME_LIMIT          -> monthly MCP/tool-call count
+WINDOW_LABELS = {
+  ("TOKENS_LIMIT", 3): "Session (5-hour)",
+  ("TOKENS_LIMIT", 6): "Weekly (7-day)",
+  ("TIME_LIMIT", 5): "MCP calls (monthly)",
+  ("TIME_LIMIT", 0): "MCP calls (monthly)",
+}
+
+
+def number(value: Any) -> float:
+  try:
+    return float(value)
+  except (TypeError, ValueError):
+    return 0.0
+
+
+def state_dir() -> Path:
+  return Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "omarchy" / "agents" / "usage"
+
+
+def cache_root() -> Path:
+  return Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "omarchy" / "agent-usage"
+
+
+def config_file() -> Path:
+  return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "omarchy" / "agents" / "zai.json"
+
+
+def normalize_reset_at(raw: Any) -> str:
+  if raw is None:
+    return ""
+  if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+    seconds = int(raw) / 1000  # nextResetTime is a millisecond epoch
+    try:
+      return dt.datetime.fromtimestamp(seconds, tz=dt.timezone.utc).isoformat()
+    except Exception:
+      return ""
+  text = str(raw).strip()
+  if text == "":
+    return ""
+  if text.isdigit():
+    try:
+      return dt.datetime.fromtimestamp(int(text) / 1000, tz=dt.timezone.utc).isoformat()
+    except Exception:
+      return text
+  try:
+    return dt.datetime.fromisoformat(text.replace("Z", "+00:00")).isoformat()
+  except Exception:
+    return text
+
+
+def resolve_api_key() -> str:
+  try:
+    data = json.loads(config_file().read_text(encoding="utf-8"))
+    key = str(data.get("apiKey") or "").strip()
+    if key:
+      return key
+  except Exception:
+    pass
+
+  for env in ("ZAI_API_KEY", "ZAI_CODING_API_KEY"):
+    key = os.environ.get(env, "").strip()
+    if key:
+      return key
+
+  try:
+    auth = json.loads((Path.home() / ".local" / "share" / "opencode" / "auth.json").read_text(encoding="utf-8"))
+    for name in ("zai-coding-plan", "zai"):
+      entry = auth.get(name)
+      key = str(entry.get("key") or "").strip() if isinstance(entry, dict) else ""
+      if key:
+        return key
+  except Exception:
+    pass
+
+  return ""
+
+
+def window_label(entry: dict[str, Any]) -> str:
+  kind = str(entry.get("type") or "")
+  unit = int(number(entry.get("unit")))
+  return WINDOW_LABELS.get((kind, unit)) or WINDOW_LABELS.get((kind, 0)) or f"{kind or 'Quota'} (unit {unit})"
+
+
+def probe_limits(api_key: str) -> dict[str, Any]:
+  request = urllib.request.Request(
+    QUOTA_ENDPOINT,
+    headers={
+      "Authorization": api_key,
+      "Content-Type": "application/json",
+      "Accept-Language": "en-US,en",
+      "User-Agent": USER_AGENT,
+    },
+  )
+  try:
+    with urllib.request.urlopen(request, timeout=10) as response:
+      payload = json.loads(response.read().decode("utf-8", errors="replace"))
+  except urllib.error.HTTPError as error:
+    if error.code in (401, 403):
+      return {"ok": False, "auth": True, "helpText": f"Z.ai rejected the API key (status {error.code}). Reissue a coding-plan key at z.ai/manage-apikey."}
+    return {"ok": False, "helpText": f"Z.ai's usage endpoint returned status {error.code}."}
+  except Exception:
+    return {"ok": False, "transport": True, "helpText": "Couldn't reach Z.ai's usage endpoint. Retrying shortly."}
+
+  # The endpoint answers HTTP 200 even for auth failure (code 1000), so the
+  # body flags decide, not the status line.
+  if not isinstance(payload, dict) or payload.get("success") is not True or number(payload.get("code")) != 200:
+    code = payload.get("code") if isinstance(payload, dict) else "?"
+    if code == 1000:
+      return {"ok": False, "auth": True, "helpText": "Z.ai authentication failed for this API key. Reissue a coding-plan key at z.ai/manage-apikey."}
+    return {"ok": False, "helpText": f"Z.ai's usage endpoint returned code {code}."}
+
+  data = payload.get("data")
+  if not isinstance(data, dict):
+    return {"ok": False, "helpText": "Z.ai's usage endpoint returned no quota data."}
+
+  limits: list[dict[str, Any]] = []
+  for entry in data.get("limits") or []:
+    if not isinstance(entry, dict):
+      continue
+    # The panel wants a fraction (0..1) and multiplies by 100 itself.
+    percent = -1.0
+    if "percentage" in entry:
+      percent = number(entry.get("percentage")) / 100
+    elif number(entry.get("usage")) > 0:
+      percent = number(entry.get("currentValue")) / number(entry.get("usage"))
+    if not (0 <= percent <= 1):
+      continue
+    limits.append({"label": window_label(entry), "percent": round(percent, 4), "resetsAt": normalize_reset_at(entry.get("nextResetTime"))})
+
+  if not limits:
+    return {"ok": False, "helpText": "Z.ai's usage endpoint returned no quota windows."}
+  tier = data.get("level")
+  return {"ok": True, "limits": limits, "tier": str(tier) if isinstance(tier, str) and tier else ""}
+
+
+def limit_window_open(entry: dict[str, Any], now: dt.datetime) -> bool:
+  raw = str(entry.get("resetsAt") or "")
+  if raw == "":
+    return True
+  try:
+    resets_at = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+  except Exception:
+    return True
+  if resets_at.tzinfo is None:
+    resets_at = resets_at.replace(tzinfo=dt.timezone.utc)
+  return resets_at > now
+
+
+def usable_cached_limits(cached: dict[str, Any]) -> list[dict[str, Any]]:
+  entries = cached.get("limits")
+  if not isinstance(entries, list):
+    return []
+  now = dt.datetime.now(dt.timezone.utc)
+  return [entry for entry in entries if isinstance(entry, dict) and limit_window_open(entry, now)]
+
+
+def collect_limits(api_key: str, force: bool) -> dict[str, Any]:
+  result = {"limits": [], "usageStatusText": "", "authHelpText": AUTH_HELP, "tier": ""}
+
+  probe_cache = cache_root() / "zai-limits.json"
+  try:
+    cached = json.loads(probe_cache.read_text(encoding="utf-8"))
+  except Exception:
+    cached = {}
+  fallback = usable_cached_limits(cached)
+
+  if api_key == "":
+    result["limits"] = fallback
+    result["usageStatusText"] = "Waiting for auth"
+    return result
+
+  fetched_at = number(cached.get("fetchedAtMs")) / 1000
+  if fallback and not force and time.time() - fetched_at < PROBE_MIN_INTERVAL_SECONDS:
+    result["limits"] = fallback
+    result["tier"] = str(cached.get("tier") or "")
+    result["authHelpText"] = ""
+    return result
+
+  probe = probe_limits(api_key)
+  if probe["ok"]:
+    result["limits"] = probe["limits"]
+    result["tier"] = probe.get("tier") or ""
+    result["authHelpText"] = ""
+    cache_root().mkdir(parents=True, exist_ok=True)
+    probe_cache.write_text(
+      json.dumps({"fetchedAtMs": round(time.time() * 1000), "limits": probe["limits"], "tier": result["tier"]}),
+      encoding="utf-8",
+    )
+    return result
+
+  if probe.get("transport"):
+    result["retryAdvised"] = True
+  if probe.get("auth"):
+    result["usageStatusText"] = "Z.ai sign-in expired" if fallback else "Z.ai auth failed"
+    result["authHelpText"] = probe["helpText"] + (" Showing the last known limits." if fallback else "")
+  else:
+    result["usageStatusText"] = "Z.ai limits unavailable"
+    result["authHelpText"] = probe["helpText"]
+  result["limits"] = fallback
+  return result
+
+
+def main() -> int:
+  parser = argparse.ArgumentParser()
+  parser.add_argument("--force", action="store_true", help="re-probe limits, ignoring the probe cache")
+  args = parser.parse_args()
+
+  api_key = resolve_api_key()
+  limits = collect_limits(api_key, args.force)
+
+  record = {
+    "schemaVersion": 1,
+    "id": AGENT_ID,
+    "name": AGENT_NAME,
+    "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+    "ready": len(limits["limits"]) > 0,
+    "hasLocalStats": False,
+    "tierLabel": limits["tier"],
+    "usageStatusText": limits["usageStatusText"],
+    "authHelpText": limits["authHelpText"],
+    "limits": limits["limits"],
+  }
+  if limits.get("retryAdvised"):
+    record["retryAdvised"] = True
+
+  output = json.dumps(record, separators=(",", ":"), sort_keys=True)
+  out_file = state_dir() / f"{AGENT_ID}.json"
+  out_file.parent.mkdir(parents=True, exist_ok=True)
+  tmp = out_file.with_suffix(".json.tmp")
+  tmp.write_text(output + "\n", encoding="utf-8")
+  os.replace(tmp, out_file)
+  print(output)
+  return 0
+
+
+if __name__ == "__main__":
+  raise SystemExit(main())
