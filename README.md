@@ -29,9 +29,11 @@ used: it only globs `/usr/share/omarchy/bin/`, which is package-owned.
 ## Install (Omarchy plugin — recommended)
 
 ```bash
-omarchy plugin add https://forgejo.bzlab.duckdns.org/buzman/omarchy-agent-usage.git
+omarchy plugin add https://github.com/BZcreativ/omarchy-agent-usage.git
 omarchy plugin enable bz.agent-usage
 ```
+
+Mirror: `https://forgejo.bzlab.duckdns.org/buzman/omarchy-agent-usage.git`.
 
 The plugin ships a small QML service that runs both collectors every 5
 minutes while `omarchy-shell` is running. Nothing touches systemd or
