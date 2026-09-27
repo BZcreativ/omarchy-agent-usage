@@ -21,11 +21,13 @@ Item {
   Process {
     id: kimiProcess
     command: [root.pluginDir + "/bin/omarchy-agent-usage-kimi"]
+    onExited: running = false
   }
 
   Process {
     id: zaiProcess
     command: [root.pluginDir + "/bin/omarchy-agent-usage-zai"]
+    onExited: running = false
   }
 
   Timer {
