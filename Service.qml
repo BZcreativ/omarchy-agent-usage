@@ -1,5 +1,6 @@
 import QtQuick
 import Quickshell
+import Quickshell.Io
 
 // Feeds the omarchy.agents panel by running the Kimi and Z.ai collectors on a
 // timer. The collectors are display-agnostic: they write
