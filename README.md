@@ -14,6 +14,7 @@ systemd user session.
 
 | File | Purpose |
 |---|---|
+| `manifest.json` + `Service.qml` | Omarchy shell plugin (`bz.agent-usage`): a service that runs both collectors every 5 min. |
 | `bin/omarchy-agent-usage-kimi` | Probes `https://api.kimi.ai/coding/v1/usages` (global; CN: `api.kimi.com`), `Authorization: Bearer <key>` — the endpoint behind kimi.ai *Settings → Subscription → Quota*. |
 | `bin/omarchy-agent-usage-zai` | Probes `https://api.z.ai/api/monitor/usage/quota/limit`, `Authorization: <raw key>` (no `Bearer`; matches [Z.ai's official query-usage script](https://github.com/zai-org/zai-coding-plugins)) — the endpoint behind z.ai *manage-apikey → coding-plan → usage*. |
 | `systemd/omarchy-agent-usage-extra.service` | oneshot running both collectors. |
@@ -25,15 +26,25 @@ the record directory the agents panel watches — the tabs appear automatically,
 no QML changes. The packaged `omarchy-agent-usage-update` dispatcher is *not*
 used: it only globs `/usr/share/omarchy/bin/`, which is package-owned.
 
-## Install
+## Install (Omarchy plugin — recommended)
 
 ```bash
-./install.sh
+omarchy plugin add https://forgejo.bzlab.duckdns.org/buzman/omarchy-agent-usage.git
+omarchy plugin enable bz.agent-usage
 ```
 
-Manual: copy `bin/*` to `~/.local/bin/`, `systemd/*` to
-`~/.config/systemd/user/`, then
-`systemctl --user enable --now omarchy-agent-usage-extra.timer`.
+The plugin ships a small QML service that runs both collectors every 5
+minutes while `omarchy-shell` is running. Nothing touches systemd or
+`~/.local/bin`.
+
+## Install (systemd, non-Omarchy or no shell plugin)
+
+Copy `bin/*` to `~/.local/bin/`, `systemd/*` to `~/.config/systemd/user/`,
+then `systemctl --user enable --now omarchy-agent-usage-extra.timer`.
+Or run `./install.sh` which does exactly that.
+
+> Don't run both paths at once on the same machine — the probe caches absorb
+> most double-polling, but one timer is the boring choice.
 
 ## Credentials
 

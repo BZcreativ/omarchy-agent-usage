@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "bz.agent-usage",
+  "name": "Kimi/Z.ai Agent Usage",
+  "version": "1.0.0",
+  "author": "buzman",
+  "description": "Feeds Kimi Code and Z.ai GLM Coding Plan quota (5h / weekly / monthly MCP windows) into the omarchy.agents bar panel.",
+  "kinds": [
+    "service"
+  ],
+  "entryPoints": {
+    "service": "Service.qml"
+  }
+}
