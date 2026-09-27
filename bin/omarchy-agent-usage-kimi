@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+# omarchy:summary=Print the Kimi Code usage record as JSON
+
+"""Collect Kimi Code quota into one display-ready JSON record.
+
+Probes Moonshot's coding usage endpoint (the one behind
+kimi.ai/settings/subscription?tab=quota) and writes the record the
+omarchy.agents panel watches at
+~/.local/state/omarchy/agents/usage/kimi.json.
+
+Credential resolution, first match wins:
+  1. ~/.config/omarchy/agents/kimi.json  {"apiKey": ..., "region": "global"|"cn"}
+  2. $KIMI_API_KEY / $KIMI_CODE_API_KEY (region "global"),
+     $KIMI_GLOBAL_API_KEY (global), $KIMI_CN_API_KEY (cn)
+  3. ~/.kimi/config.toml provider "managed:kimi-code" (api_key + base_url host)
+  4. opencode auth.json: kimi-code-plan-global (global), kimi-code-plan-cn (cn),
+     kimi-for-coding / kimi-code / kimi (global)
+
+Region selects the host; keys are region-bound and are never retried across
+hosts: global -> https://api.kimi.ai, cn -> https://api.kimi.com.
+"""
+
+import argparse
+import datetime as dt
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+AGENT_ID = "kimi"
+AGENT_NAME = "Kimi Code"
+ENDPOINTS = {"global": "https://api.kimi.ai/coding/v1/usages", "cn": "https://api.kimi.com/coding/v1/usages"}
+USER_AGENT = "omarchy-agent-usage-kimi"
+PROBE_MIN_INTERVAL_SECONDS = 60
+AUTH_HELP = (
+  "Set a Kimi Code API key in ~/.config/omarchy/agents/kimi.json: "
+  '{"apiKey": "sk-...", "region": "global" or "cn"}. '
+  "Issue the key from the Kimi Code console (kimi.ai/code or kimi.com); "
+  "it is the same key used as ANTHROPIC_AUTH_TOKEN with "
+  "https://api.kimi.ai/coding/v1."
+)
+
+
+def number(value: Any) -> float:
+  try:
+    return float(value)
+  except (TypeError, ValueError):
+    return 0.0
+
+
+def state_dir() -> Path:
+  return Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "omarchy" / "agents" / "usage"
+
+
+def cache_root() -> Path:
+  return Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "omarchy" / "agent-usage"
+
+
+def config_file() -> Path:
+  return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "omarchy" / "agents" / "kimi.json"
+
+
+def normalize_reset_at(raw: Any) -> str:
+  if raw is None:
+    return ""
+  text = str(raw).strip()
+  if text == "":
+    return ""
+  if text.isdigit():
+    seconds = int(text)
+    if seconds > 10_000_000_000:  # milliseconds epoch
+      seconds //= 1000
+    return dt.datetime.fromtimestamp(seconds, tz=dt.timezone.utc).isoformat()
+  try:
+    return dt.datetime.fromisoformat(text.replace("Z", "+00:00")).isoformat()
+  except Exception:
+    return text
+
+
+def resolve_credentials() -> tuple[str, str]:
+  """Returns (api_key, region)."""
+  try:
+    data = json.loads(config_file().read_text(encoding="utf-8"))
+    key = str(data.get("apiKey") or "").strip()
+    if key:
+      region = str(data.get("region") or "global").strip().lower()
+      return key, ("cn" if region == "cn" else "global")
+  except Exception:
+    pass
+
+  for env, region in (
+    ("KIMI_API_KEY", "global"),
+    ("KIMI_CODE_API_KEY", "global"),
+    ("KIMI_GLOBAL_API_KEY", "global"),
+    ("KIMI_CN_API_KEY", "cn"),
+  ):
+    key = os.environ.get(env, "").strip()
+    if key:
+      return key, region
+
+  try:
+    import tomllib
+
+    toml = tomllib.loads((Path.home() / ".kimi" / "config.toml").read_text(encoding="utf-8"))
+    provider = (toml.get("providers") or {}).get("managed:kimi-code") or {}
+    key = str(provider.get("api_key") or "").strip()
+    if key:
+      base = str(provider.get("base_url") or "").strip()
+      region = "cn" if "kimi.com" in base and "kimi.ai" not in base else "global"
+      return key, region
+  except Exception:
+    pass
+
+  try:
+    auth = json.loads((Path.home() / ".local" / "share" / "opencode" / "auth.json").read_text(encoding="utf-8"))
+    for name, region in (
+      ("kimi-code-plan-global", "global"),
+      ("kimi-code-plan-cn", "cn"),
+      ("kimi-for-coding", "global"),
+      ("kimi-code", "global"),
+      ("kimi", "global"),
+    ):
+      entry = auth.get(name)
+      key = str(entry.get("key") or "").strip() if isinstance(entry, dict) else ""
+      if key:
+        return key, region
+  except Exception:
+    pass
+
+  return "", "global"
+
+
+def usage_bucket(detail: Any) -> dict[str, Any]:
+  return detail if isinstance(detail, dict) else {}
+
+
+def bucket_percent(bucket: dict[str, Any]) -> float:
+  """Fraction of the window used, 0..1 — the panel multiplies by 100."""
+  limit = number(bucket.get("limit"))
+  if limit <= 0:
+    return -1
+  used = bucket.get("used")
+  if used is None:
+    used = limit - number(bucket.get("remaining"))
+  return round(number(used) / limit, 4)
+
+
+def bucket_reset(bucket: dict[str, Any]) -> str:
+  for key in ("resetTime", "reset_at", "resetAt", "reset_in", "ttl"):
+    if key in bucket:
+      return normalize_reset_at(bucket.get(key))
+  return ""
+
+
+def window_label(window: Any) -> str:
+  if not isinstance(window, dict):
+    return "Rate limit"
+  duration = number(window.get("duration"))
+  unit = str(window.get("timeUnit") or "").upper()
+  if "MINUTE" in unit:
+    if duration == 300:
+      return "Session (5-hour)"
+    if duration == 10080:
+      return "Weekly (7-day)"
+    if duration and duration % 60 == 0:
+      return f"Session ({int(duration / 60)}-hour)"
+    return f"Window ({int(duration)} min)" if duration else "Rate limit"
+  if "DAY" in unit:
+    if duration == 7:
+      return "Weekly (7-day)"
+    return f"Window ({int(duration)} day)" if duration else "Rate limit"
+  if "HOUR" in unit:
+    if duration == 5:
+      return "Session (5-hour)"
+    return f"Session ({int(duration)}-hour)" if duration else "Rate limit"
+  return "Rate limit"
+
+
+def probe_limits(api_key: str, region: str) -> dict[str, Any]:
+  request = urllib.request.Request(
+    ENDPOINTS[region],
+    headers={"Authorization": "Bearer " + api_key, "User-Agent": USER_AGENT, "Accept": "application/json"},
+  )
+  try:
+    with urllib.request.urlopen(request, timeout=10) as response:
+      payload = json.loads(response.read().decode("utf-8", errors="replace"))
+  except urllib.error.HTTPError as error:
+    if error.code in (401, 403):
+      return {"ok": False, "auth": True, "helpText": f"Kimi rejected the API key (status {error.code}). Check the key and its region in ~/.config/omarchy/agents/kimi.json."}
+    return {"ok": False, "helpText": f"Kimi's usage endpoint returned status {error.code}."}
+  except Exception:
+    return {"ok": False, "transport": True, "helpText": "Couldn't reach Kimi's usage endpoint. Retrying shortly."}
+
+  if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+    payload = payload["data"]
+
+  limits: list[dict[str, Any]] = []
+  weekly_seen = False
+  for entry in payload.get("limits") or []:
+    if not isinstance(entry, dict):
+      continue
+    percent = bucket_percent(usage_bucket(entry.get("detail")))
+    if percent < 0:
+      continue
+    label = window_label(entry.get("window"))
+    if label.startswith("Weekly"):
+      weekly_seen = True
+    limits.append({"label": label, "percent": percent, "resetsAt": bucket_reset(usage_bucket(entry.get("detail")))})
+
+  weekly = usage_bucket(payload.get("usage"))
+  weekly_percent = bucket_percent(weekly)
+  if weekly_percent >= 0 and not weekly_seen:
+    limits.insert(0, {"label": "Weekly (7-day)", "percent": weekly_percent, "resetsAt": bucket_reset(weekly)})
+
+  if not limits:
+    return {"ok": False, "helpText": "Kimi's usage endpoint returned no quota windows."}
+  return {"ok": True, "limits": limits}
+
+
+def limit_window_open(entry: dict[str, Any], now: dt.datetime) -> bool:
+  raw = str(entry.get("resetsAt") or "")
+  if raw == "":
+    return True
+  try:
+    resets_at = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+  except Exception:
+    return True
+  if resets_at.tzinfo is None:
+    resets_at = resets_at.replace(tzinfo=dt.timezone.utc)
+  return resets_at > now
+
+
+def usable_cached_limits(cached: dict[str, Any]) -> list[dict[str, Any]]:
+  entries = cached.get("limits")
+  if not isinstance(entries, list):
+    return []
+  now = dt.datetime.now(dt.timezone.utc)
+  return [entry for entry in entries if isinstance(entry, dict) and limit_window_open(entry, now)]
+
+
+def collect_limits(api_key: str, region: str, force: bool) -> dict[str, Any]:
+  result = {"limits": [], "usageStatusText": "", "authHelpText": AUTH_HELP}
+
+  probe_cache = cache_root() / "kimi-limits.json"
+  try:
+    cached = json.loads(probe_cache.read_text(encoding="utf-8"))
+  except Exception:
+    cached = {}
+  fallback = usable_cached_limits(cached)
+
+  if api_key == "":
+    result["limits"] = fallback
+    result["usageStatusText"] = "Waiting for auth"
+    return result
+
+  fetched_at = number(cached.get("fetchedAtMs")) / 1000
+  if fallback and not force and time.time() - fetched_at < PROBE_MIN_INTERVAL_SECONDS:
+    result["limits"] = fallback
+    return result
+
+  probe = probe_limits(api_key, region)
+  if probe["ok"]:
+    result["limits"] = probe["limits"]
+    result["authHelpText"] = ""
+    cache_root().mkdir(parents=True, exist_ok=True)
+    probe_cache.write_text(json.dumps({"fetchedAtMs": round(time.time() * 1000), "limits": probe["limits"]}), encoding="utf-8")
+    return result
+
+  if probe.get("transport"):
+    result["retryAdvised"] = True
+  if probe.get("auth"):
+    result["usageStatusText"] = "Kimi sign-in expired" if fallback else "Kimi auth failed"
+    result["authHelpText"] = probe["helpText"] + (" Showing the last known limits." if fallback else "")
+  elif fallback:
+    result["usageStatusText"] = "Kimi limits unavailable"
+  else:
+    result["usageStatusText"] = "Kimi limits unavailable"
+    result["authHelpText"] = probe["helpText"]
+  result["limits"] = fallback
+  return result
+
+
+def main() -> int:
+  parser = argparse.ArgumentParser()
+  parser.add_argument("--force", action="store_true", help="re-probe limits, ignoring the probe cache")
+  args = parser.parse_args()
+
+  api_key, region = resolve_credentials()
+  limits = collect_limits(api_key, region, args.force)
+
+  record = {
+    "schemaVersion": 1,
+    "id": AGENT_ID,
+    "name": AGENT_NAME,
+    "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+    "ready": len(limits["limits"]) > 0,
+    "hasLocalStats": False,
+    "tierLabel": "",
+    "usageStatusText": limits["usageStatusText"],
+    "authHelpText": limits["authHelpText"],
+    "limits": limits["limits"],
+  }
+  if limits.get("retryAdvised"):
+    record["retryAdvised"] = True
+
+  output = json.dumps(record, separators=(",", ":"), sort_keys=True)
+  out_file = state_dir() / f"{AGENT_ID}.json"
+  out_file.parent.mkdir(parents=True, exist_ok=True)
+  tmp = out_file.with_suffix(".json.tmp")
+  tmp.write_text(output + "\n", encoding="utf-8")
+  os.replace(tmp, out_file)
+  print(output)
+  return 0
+
+
+if __name__ == "__main__":
+  raise SystemExit(main())

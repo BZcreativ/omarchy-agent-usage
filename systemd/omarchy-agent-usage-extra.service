@@ -1,0 +1,7 @@
+[Unit]
+Description=Update Kimi and Z.ai agent usage records for the omarchy.agents panel
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/omarchy-agent-usage-kimi
+ExecStart=%h/.local/bin/omarchy-agent-usage-zai
